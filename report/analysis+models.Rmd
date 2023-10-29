@@ -1,0 +1,1140 @@
+---
+title: "analysis+models"
+output: html_document
+---
+
+```{r, echo = FALSE, message = FALSE, warning=FALSE}
+source(here::here("scripts/setup.R"))
+```
+
+# Analysis
+In this section, we would like to have a closer look at each station.
+
+## Casino
+
+### 1. Plot data and identify unusual observation
+```{r, echo = FALSE, message = FALSE, warning=FALSE}
+casino %>% autoplot(total, size=0.7) + 
+  theme(legend.position = 'bottom')
+
+```
+
+- From the graphs of weekly pattern in EDA part. we can observe that Casino station is one of the stations that have not clear seasonality.   
+- Compared to daily pattern, it seems that there are a bit hourly seasonality.
+- And, no obvious trend for sure.
+
+
+### 2. Find a proper deferencing for non-stationary         
+```{r, echo = FALSE, message = FALSE, warning=FALSE}
+casino %>% features(total,unitroot_kpss) #pvalue 0.01 
+casino %>% features(total,unitroot_ndiffs)
+casino %>% features(difference(total),unitroot_kpss)
+
+```
+- Here, we just try to check the differencing in advance. And, one differencing is enough.    
+
+
+### 3. Preparation for determining model  
+
+#### 3.1. ACF and PACF
+
+```{r, echo = FALSE, message = FALSE, warning=FALSE}
+gg_tsdisplay(casino,total, plot_type = "partial", lag_max = 8064)
+gg_tsdisplay(casino,difference(total), plot_type = "partial", lag_max = 8064)
+
+```
+
+*According to the plot after one time differencing, it is still hard to decide if it indeed only needs one time differencing or not, in this case, we would like to let R build models for us in next step, and try to find more possibility based on auto models.     
+
+#### 3.2. Spectrogram
+
+```{r}
+p.casino <- spec.pgram(casino$total)
+
+data.table(period=1/p.casino$freq, spec=p.casino$spec)[order(-spec)][1:2]
+```
+
+- As it does not have clear seasonality, we would like to use spectrogram as a complementary method to help us detect its strong period. - we calculate the top 2 strongest period and apply it to model later. 
+
+
+##### 3.3 STL Component    
+```{r}
+casino %>% 
+  model(STL(total)) %>% 
+  components()%>%
+  autoplot()
+
+```
+- There are no increase or decrease trend, it fluctuates frequently.   
+- According to STL function's detection, it has multiple seasonality.    
+- Residuals plays a important role.    
+- daily seasonality more obvious than the others
+
+
+### 4. Models
+
+#### 4.1 create train set for cross-validation
+
+```{r}
+casino_tr <- casino %>% stretch_tsibble(.init = 144*7*7, 
+                                                  .step=234)%>%
+  relocate(date, total, .id) 
+```
+
+- we use cross-validation method to split train set to build model and measure the RMSE with real data, so that we can find a better model.   
+
+#### 4.2 select best model
+```{r}
+
+##compared to many models
+casino_tr %>% model(
+             mean=MEAN(total),
+             snaive = SNAIVE(total ~ lag("day")),
+             arimaauto = ARIMA(total), #<ARIMA(1,1,1)(0,0,1)[6]>
+             stlets=decomposition_model(STL(total,robust=TRUE),
+                            ETS(season_adjust~season("N"))),#first choose auto arima, then based on auto model try to use acf pacf to test the others manually #111011not big different to the auto #arima112002
+             marimaauto = ARIMA(total ~ PDQ(0, 0, 0) + pdq(d = 0) +
+                  fourier(period = 2734, K = 1)+
+               fourier(period = 10935, K = 1))) %>% 
+# 
+                  forecast(h = 234) %>% accuracy(casino)
+
+```
+
+- As mentioned above, we prefer let R choose first. Yet, we also try some possibility based on R's choice; however, they do not have a better performance than the auto models. Due to the burden of calculation in R, we prefer to only keep the better model here to compare in depth.    
+- In this case, we can observe the RMSE of auto ARIMA and ARIMA with Fourier are so close, which means there may be a change after data updated. Yet, so far, ARIMA with Fourier is the best.        
+
+
+```{r}
+casino.fit1 <- casino %>% model( marimaauto = ARIMA(total ~ PDQ(0, 0, 0) + pdq(d = 0) +
+                  fourier(period = 2734, K = 1)+
+               fourier(period = 10935, K = 1)))
+report(casino.fit1)
+
+casino.fit2 <- casino %>% model(arimaauto = ARIMA(total))
+report(casino.fit2)
+```
+
+- As the RMSE of auto ARIMA and ARIMA with Fourier are so close, as mentioned above, we prefer to check more information of them in depth
+- At the same time, as we choose a fixed value for Fourier terms, which is the limitation, it would have better performance if we can iterate K to select the best one based on AICc. If we do not do that, it might be possible that auto ARIMA would have better performance in terms of RMSE after updating data.      
+
+
+#### 4.3 combine with weather variables
+
+```{r}
+casino.fit1.1 <- casino %>% model( marimaauto = ARIMA(total ~ tre200s0 + rre150z0 + fu3010z0 + 
+                                                      PDQ(0, 0, 0) + pdq(d = 0) +
+                  fourier(period = 2734, K = 1)+
+               fourier(period = 10935, K = 1)))
+report(casino.fit1.1)
+
+casino.fit2.1 <- casino %>% model(arimareg = ARIMA(total~tre200s0+rre150z0+fu3010z0))
+report(casino.fit2.1)
+```
+
+- Then, as ARIMA model can add the possibility of regression terms, here we add three variables into the model.   
+
+### 5. Check residuals
+
+```{r}
+# if so, check their residuals then
+# ARIMA Fourier
+casino.fit1  %>% gg_tsresiduals()
+
+c.marima.resi <- casino.fit1 %>% residuals(type = c("innovation")) 
+qqPlot(c.marima.resi$.resid)
+Box.test(c.marima.resi$.resid, type = "Ljung")
+
+# ARIMA Fourier+regression 
+casino.fit1.1  %>% gg_tsresiduals()
+
+c.marimareg.resi <- casino.fit1.1 %>% residuals(type = c("innovation")) 
+qqPlot(c.marimareg.resi$.resid)
+Box.test(c.marimareg.resi$.resid, type = "Ljung")
+
+# auto ARIMA
+casino.fit2  %>% gg_tsresiduals()
+
+c.autoarima1.resi <- casino.fit2 %>% residuals(type = c("innovation")) 
+qqPlot(c.autoarima1.resi$.resid)
+Box.test(c.autoarima1.resi$.resid, type = "Ljung")
+
+# auto ARIMA + regression 
+casino.fit2.1  %>% gg_tsresiduals()
+
+c.autoarima2.resi <- casino.fit2.1 %>% residuals(type = c("innovation")) 
+qqPlot(c.autoarima2.resi$.resid)
+Box.test(c.autoarima2.resi$.resid, type = "Ljung")
+
+# simply check mean model
+
+casino %>% model(mean=MEAN(total)) %>% gg_tsresiduals()
+
+```
+
+- At the very beginning of analysis, RMSE showed that "mean" model had much better value, but after updating data, it changed.  
+- Due to this special case, we also wanted to check the residuals of "mean" model first, from the graphs of checking residuals. we can see that "mean" model does not have a good performance in its residuals part. There is also substantial remaining autocorrelation in the residuals, which means there is information left in the residuals.      
+- Although the innovation residuals of ARIMA models are not normally distributed (the right tail is too long), but they have better performance in ACF plot.     
+- Compared to the slightly larger in RMSE, having such a better residuals performance, ARIMA model might is better than "mean" model. Thus, no matter whether the data update or not, we won't choose "mean" model.          
+- Besides, we can see that the residuals performance of both auto ARIMA models and ARIMA models with Fourier are very similar. In this case, we would like to choose ARIMA model with Fourier + regression as the model can handle complex seasonality and consider possible impact variable, in practice, it is beneficial for adapting updated data.           
+
+### 6. Forecasting
+```{r}
+casino_forecast <- casino.fit2.1 %>%
+  forecast(h=234,new_data=casino_weather_forecast) %>% hilo(level = c(90)) 
+
+casino_forecast <-  casino_forecast %>% mutate(UpperBound=casino_forecast$`90%`$upper) 
+
+casino_forecast <- casino_forecast %>% 
+  dplyr::select(-tre200s0, -rre150z0, -fu3010z0)
+```
+
+
+## Dufour
+
+### 1. Plot data and identify unusual observation
+```{r, echo = FALSE, message = FALSE, warning=FALSE}
+dufour %>% autoplot(total, size=0.7) + 
+  theme(legend.position = 'bottom')
+
+dufour %>% features(total,unitroot_kpss) 
+```
+
+- Similar to Casino, it does not have clear pattern as well, even in terms of hourly pattern.    
+
+
+### 2. Find a proper deferencing for non-stationary
+```{r, echo = FALSE, message = FALSE, warning=FALSE}
+dufour %>% features(total,unitroot_ndiffs)
+dufour %>% features(difference(total),unitroot_kpss)
+
+```
+
+
+- R also select one time differencing for us.   
+
+
+### 3. Examine ACF and PACF to determine model
+```{r, echo = FALSE, message = FALSE, warning=FALSE}
+gg_tsdisplay(dufour,total, plot_type = "partial", lag_max = 8064)
+gg_tsdisplay(dufour,difference(total), plot_type = "partial", lag_max = 8064)
+
+```
+
+
+#### 3.1 Spectrogram to determine model
+
+```{r}
+p.dufour <- periodogram(dufour$total) 
+
+data.table(period=1/p.dufour$freq, spec=p.dufour$spec)[order(-spec)][1:2]
+```
+
+- Same as Casino, since it is hard to see if there are indeed no seasonality, we try to use spectrogram to extract more information.   
+
+#### 3.2 STL Component to determine model
+```{r}
+dufour %>% 
+  model(STL(total)) %>% 
+  components()%>%
+  autoplot()
+
+```
+
+- Multiple seasonality as well.
+- Residuals still plays a key role.
+- Weekly seasonality is larger than daily and hourly seasonality.
+- There is a slight downward trend in the beginning.
+
+### 4. Models
+
+#### 4.1 create train set for cross-validation
+
+```{r}
+dufour_tr <- dufour %>% stretch_tsibble(.init = 144*7*7, 
+                                                  .step=234)%>%
+  relocate(date, total, .id) 
+```
+
+
+#### 4.2 select best model   
+```{r}
+##compared to many models
+dufour_tr %>% model(
+             mean=MEAN(total),
+             snaive = SNAIVE(total ~ lag("day")),
+             arimaauto = ARIMA(total), #<ARIMA(1,1,1)(1,0,0)[6]>
+             #arima111110 = ARIMA(total ~ pdq(1,1,1) + PDQ(1,1,0)),#try 112101 slightly larger than auto arima        
+             stlets=decomposition_model(STL(total,robust=TRUE),
+                            ETS(season_adjust~season("N"))),
+             marimaauto = ARIMA(total ~ PDQ(0, 0, 0) + pdq(d = 0) +
+                  fourier(period = 5468, K = 1) +
+                  fourier(period = 2187, K = 1))) %>% #use periodogram to determine period 
+                  forecast(h = 234) %>% accuracy(dufour)
+
+
+```
+
+- Here, the ARIMA models with Fourier shows lowest RMSE than the others.    
+
+
+#### 4.3 combine with weather variables
+
+-Usually the weather conditions can influence people's choice of transportation. We also want to use the weather data to help us make a better forecast so we combine regression and ARIMA model.
+
+```{r}
+dufour.fit <- dufour %>% model( marimaauto = ARIMA(total ~ tre200s0 + rre150z0 + fu3010z0 + 
+                                                      PDQ(0, 0, 0) + pdq(d = 0) +
+                  fourier(period = 5468, K = 1)+
+               fourier(period = 2187, K = 1)))
+report(dufour.fit)
+
+dufour.fit.auto <- dufour %>% model( arimaauto = ARIMA(total))
+report(dufour.fit.auto)
+```
+   
+
+### 5, Check residuals
+```{r}
+#gg residuals for multiple arima auto
+dufour.fit  %>% gg_tsresiduals()
+
+#residuals info for auto arima
+d.arimaauto.resi <- dufour.fit %>% residuals(type = c("innovation")) 
+qqPlot(d.arimaauto.resi$.resid)
+Box.test(d.arimaauto.resi$.resid, type = "Ljung")
+
+dufour.fit.auto  %>% gg_tsresiduals()
+
+#residuals info for auto arima
+d.arimaauto.resi <- dufour.fit.auto %>% residuals(type = c("innovation")) 
+qqPlot(d.arimaauto.resi$.resid)
+Box.test(d.arimaauto.resi$.resid, type = "Ljung")
+
+
+```
+
+- The performance of residuals is not bad.
+- Overall, we would like to choose ARIMA model with fourier due to its smaller RMSE and not bad residuals performance.     
+
+### 6. Forecasting
+```{r}
+dufour_forecast <- dufour.fit %>%
+  forecast(h=234, new_data=dufour_weather_forecast) %>% hilo(level = c(90))
+
+dufour %>% autoplot(total)+
+  autolayer(dufour_forecast,color="red")
+
+dufour_forecast.auto <- dufour.fit.auto %>%
+  forecast(h=234,new_data=dufour_weather_forecast) %>% hilo(level = c(90)) 
+dufour_forecast.auto <- dufour_forecast.auto %>%
+  mutate(UpperBound=dufour_forecast.auto$`90%`$upper)%>% 
+  dplyr::select(-tre200s0, -rre150z0, -fu3010z0)
+
+# write.csv(x = dufour_forecast,file = "dufour_forecast_516base.csv")
+# write.csv(x = dufour_forecast.auto,file = "dufour_forecast_524base.csv")
+```
+
+
+## Temple
+
+###1. Plot data and identify unusual observatio
+```{r, echo = FALSE, message = FALSE, warning=FALSE}
+temple %>% autoplot(total, size=0.7) + 
+  theme(legend.position = 'bottom')
+
+
+```
+
+- The situation of Temple station is similar to Dufour stations in terms of what its plot shows, there are no clear pattern both in daily and hourly season plot.   
+
+###2. Find a proper deferencing for non-stationary    
+```{r, echo = FALSE, message = FALSE, warning=FALSE}
+temple %>% features(total,unitroot_kpss) 
+temple %>% features(total,unitroot_ndiffs)
+temple %>% features(difference(total),unitroot_kpss)
+
+```
+
+- one time differencing provided by R as well.    
+
+###3. Preparation for determining model     
+
+####3.1 Examine ACF and PACF to determine model     
+```{r, echo = FALSE, message = FALSE, warning=FALSE}
+gg_tsdisplay(temple,total, plot_type = "partial", lag_max = 8064)
+gg_tsdisplay(temple,difference(total), plot_type = "partial", lag_max = 8064)
+
+```
+
+####3.2. Spectrogram     
+```{r}
+p.temple <- periodogram(temple$total) 
+
+data.table(period=1/p.temple$freq, spec=p.temple$spec)[order(-spec)][1:2]
+```
+
+- Here, the two periods spectrogram extract are very close to each other, it seems like more complicated than the previous stations.Yet, we would like to apply both of them to further model building.        
+
+####3.3 STL Component      
+```{r}
+temple %>% 
+  model(STL(total)) %>% 
+  components()%>%
+  autoplot()
+
+```
+
+- No specific trend.   
+- Residuals occupies a large proportion.    
+- daily seasonality might be more significant.    
+
+###4.1 Models       
+
+#### 4.1 create train set for cross-validation
+
+```{r}
+temple_tr <- temple %>% stretch_tsibble(.init = 144*7*7, 
+                                                  .step=234)%>%
+  relocate(date, total, .id) 
+```
+
+
+#### 4.2 select best model
+```{r}
+##compared to many models
+temple_tr %>% model(
+             mean=MEAN(total),
+             snaive = SNAIVE(total ~ lag("day")),
+             stlets=decomposition_model(STL(total,robust=TRUE),
+                            ETS(season_adjust~season("N"))),
+             arimaauto = ARIMA(total), #<ARIMA(5,1,1)>
+             marimaauto = ARIMA(total ~ PDQ(0, 0, 0) + pdq(d = 0) +
+                  fourier(period = 1367, K = 1) +
+                  fourier(period = 1822, K = 1))) %>% #use periodogram to determine period 
+                  #<LM w/ ARIMA(1,0,3) errors> 1333/800 RMSE0.2233 #4846/1358 0.2230 K=3/2 not big difference
+              forecast(h = 234) %>% accuracy(casino)
+
+```
+
+- In terms of RMSE, we see that auto ARIMA and snaive have almost the same value which are also the lowest, so in further we you will use both of them to do check their residuals at the same time so that we can choose a better model.        
+
+```{r}
+temple.fit1 <- temple %>% model(arimaauto = ARIMA(total))
+report(temple.fit1)
+
+temple.fit2 <- temple %>% model(mean=MEAN(total))
+report(temple.fit2)
+
+```
+
+* multiple arima lower, then auto arima
+
+#### 4.3 combine with weather variables
+
+```{r}
+temple.fit1.1 <- temple %>% model(arimareg = ARIMA(total~tre200s0+rre150z0+fu3010z0))
+report(temple.fit1.1)
+
+temple.fit3.1 <- temple %>% model( marimaauto = ARIMA(total ~ tre200s0+rre150z0+fu3010z0+
+                                                        PDQ(0, 0, 0) + pdq(d = 0) +
+                  fourier(period = 1367, K = 1) +
+                  fourier(period = 1822, K = 1)))
+report(temple.fit3.1)
+```
+
+###5.1 Check residuals      
+```{r}
+#gg residuals for arima auto, multiple arima auto, stl+ets
+temple.fit1 %>% gg_tsresiduals()
+temple.fit2 %>% gg_tsresiduals()
+temple.fit1.1 %>% gg_tsresiduals()
+temple.fit3.1 %>% gg_tsresiduals()
+
+t.arimaauto.resi <- temple.fit1 %>% residuals(type = c("innovation")) 
+qqPlot(t.arimaauto.resi$.resid)
+Box.test(t.arimaauto.resi$.resid, type = "Ljung")
+
+t.snaive.resi <- temple.fit2 %>% residuals(type = c("innovation")) 
+qqPlot(t.snaive.resi$.resid)
+Box.test(t.snaive.resi$.resid, type = "Ljung")
+
+t.arimareg.resi <- temple.fit1.1 %>% residuals(type = c("innovation")) 
+qqPlot(t.arimareg.resi$.resid)
+Box.test(t.arimareg.resi$.resid, type = "Ljung")
+
+t.marimareg.resi <- temple.fit3.1 %>% residuals(type = c("innovation")) 
+qqPlot(t.marimareg.resi$.resid)
+Box.test(t.marimareg.resi$.resid, type = "Ljung")
+
+```
+
+- From the residuals graphs, we can see that ARIMA models have better performance in terms of autocorrelation and distribution  
+- Although the distributions of ARIMA models are not so close to 0, but their tails are balanced.   
+- In this case, we would like to choose ARIMA models. Thus, we would like to use ARIMA with regression model to do the forecasting.     
+
+###6. Forecasting    
+```{r}
+temple_forecast1 <- temple.fit1.1 %>% #516base auto arima + regression
+  forecast(h=234,new_data=temple_weather_forecast) %>% hilo(level = c(90))
+temple %>% autoplot(total)+
+  autolayer(temple_forecast1,color="red")
+
+temple_forecast2 <- temple.fit3.1 %>% #524base arima fourier + regression
+  forecast(h=234,new_data=temple_weather_forecast) %>% hilo(level = c(90)) 
+
+temple_forecast2 <- temple_forecast2 %>%
+  mutate(UpperBound=temple_forecast2$`90%`$upper)%>% 
+  dplyr::select(-tre200s0, -rre150z0, -fu3010z0)
+
+temple %>% autoplot(total)+
+  autolayer(temple_forecast2,color="red")
+
+# write.csv(x = temple_forecast1,file = "temple_forecast_516base.csv")
+# write.csv(x = temple_forecast2,file = "temple_forecast_524base.csv")
+
+```
+
+
+
+
+
+## Gracieuse
+
+### 1. Plot data and see the pattern
+
+It is hard to see clear trend and seasonality of gracieuse station from the plot.
+```{r}
+gracieuse %>% autoplot(total, size=0.7) + 
+  theme(legend.position = 'bottom')
+
+```
+
+### 2.STL decompostion plot
+We use the STL decomposition to see whether there is seasonality or trend.
+Components:
+1.trend: no clear trend.
+2.seasonality: according to the size of the grey bar to the left of each panel, the daily seasonality is the largest and then is the weekly seasonality. The hourly seasonality is the smallest. But all these seasonality are very small.
+3.remainder: We can notice that the remainder is very large. It means remainder accounts for a large part of variation of data.
+
+```{r}
+gracieuse.STL <- gracieuse %>% model(STL(total,robust = TRUE))
+gracieuse.STL %>% components() %>% autoplot()
+```
+
+### 3.periodogram
+
+We try to use the periodogram to check the seasonality of time series. It is hard to see from the plot so we use a formula to calculate the 2 largest seasonality periods.
+```{r}
+gracieuse_p<-periodogram(gracieuse$total)
+data.table(period=1/gracieuse_p$freq,
+           spec=gracieuse_p$spec)[order(-spec)][1:2]
+```
+### 4.build model
+
+We want to evaluate model quality by comparing forecast accuracy. It may be unstable to split the time series into train set and test set just for once. A more sophisticated version of training/test sets is time series cross-validation. So we use cross-validation to get a more accurate result.
+
+Our final goal is to forecast 1 day in the future so we compare the forecast accuracy of each model to forecast one day and select the best one.
+
+#### 4.1 create train set for cross-validation
+
+```{r}
+gracieuse_tr <- gracieuse %>% stretch_tsibble(.init = 144*7*7, 
+                                                  .step=234)%>%
+  relocate(date, total, .id) 
+```
+
+#### 4.2 select best model
+
+We use mean model ans SNAIVE model as bench marks. 
+
+We also use ETS model.
+
+The decomposition can also be used in forecasting, with each of the seasonal components forecast using a seasonal naïve method, and the seasonally adjusted data forecast using ETS.
+
+Finally We consider ARIMA models, one is an automatic ARIMA model which will be decided by fable package ARIMA function and other one is ARIMA model with multiple seasonal period. We use the period calculated according to periodgram. For the k value of fourier, we just make it equals to 1 (which gives the smoothest prediction)to make the model run time shortest.
+
+```{r}
+gracieuse_tr %>%
+  model(mean=MEAN(total),
+        snaive = SNAIVE(total ~ lag("day")),
+        ets = ETS(total),
+        stlets=decomposition_model(STL(total,robust=TRUE),
+                            ETS(season_adjust~season("N"))),
+        arimaa=ARIMA(total),
+        arimaf=ARIMA(total ~ PDQ(0, 0, 0) + pdq(d = 0)+
+                       fourier(period=1822,K = 1)+
+                       fourier(period=2734,K = 1))
+        ) %>% forecast(h = 234) %>% accuracy(gracieuse)
+```
+
+
+We want the model with the smallest RMSE so we choose simple ARIMA model AND ETS model. But ARIMA model has a lower MASE than ETS model so we finally choose the simple ARIMA model.
+
+
+
+#### 4.3 combine with weather variables
+
+Usually the weather conditions can influence people's choice of transportation. We also want to use the weather data to help us make a better forecast so we combine regression and ARIMA model.
+
+```{r}
+gracieuse_fit <- gracieuse %>% model(ARIMA(total~tre200s0+rre150z0+fu3010z0))
+report(gracieuse_fit)
+```
+
+### 5.check residuals
+
+According to the ACF plot, the innovation residuals are uncorrelated.It shows there is no information left in the residuals which should be used in computing forecasts.
+The innovation residuals have zero mean which shows the forecasts are unbiased.
+```{r}
+gracieuse_fit %>% gg_tsresiduals()
+```
+
+
+### 6.forecast
+
+```{r}
+gracieuse_forecast <- gracieuse_fit %>%
+  forecast(h=234, new_data=gracieuse_weather_forecast ) %>% hilo(level = c(90)) 
+
+gracieuse_forecast <- gracieuse_forecast %>%
+  mutate(UpperBound=gracieuse_forecast$`90%`$upper)%>% 
+  dplyr::select(-tre200s0, -rre150z0, -fu3010z0)
+
+
+gracieuse %>% autoplot(total)+
+  autolayer(gracieuse_forecast,color="red")
+```
+
+
+## Medtronic
+
+### 1. Plot data and see the pattern
+The plot and the kpss test show that the time series is not stationary
+```{r}
+medtronic %>% autoplot(total, size=0.7) + 
+  theme(legend.position = 'bottom')
+
+medtronic %>% features(total,unitroot_kpss) 
+#pvalue (0.01) is very low so we reject the null hypothesis that the time series is stationary
+```
+
+#### 1.2 Find a proper diferencing for non-stationary
+The unitroot test shows that only one difference is proper to create stationary
+```{r, echo = FALSE, message = FALSE, warning=FALSE}
+medtronic %>% features(total,unitroot_ndiffs)
+medtronic %>% features(difference(total),unitroot_kpss)
+#pvalue is 0.1 which is large enough to not reject the null hypothesis
+```
+
+#### 1.3 Examine ACF and PACF to determine model
+The chart shows that the data with one differencing is stationary; however, it seems to have seasonality from ACF plot.
+```{r, echo = FALSE, message = FALSE, warning=FALSE}
+gg_tsdisplay(medtronic,difference(total), plot_type = "partial", lag_max = 2000)
+```
+
+### 2. STL decompostion plot
+We use the STL decomposition to see whether there is seasonality or trend.
+Components:
+1.trend: there was no trend before May 7th. After that date, we see a downward trend.
+2.seasonality: there are strong weekly and daily seasonality.
+3.remainder: the remainder is very large. It means remainder accounts for a large part of variation of data.
+
+```{r}
+medtronic.STL <- medtronic %>% model(STL(total,robust = TRUE))
+medtronic.STL %>% components() %>% autoplot()
+```
+
+### 3. Periodogram
+
+We use the periodogram to check the seasonality of time series by using a below formula to calculate the 2 largest seasonality periods. However, there are strong daily and weekly seasonality in Medtronic station. Thus, 144(6 * 24) and 1008(144 * 7) will be applied for running period since they refer to 1 day and 1 week respectively.
+```{r}
+medtronic_p<-periodogram(medtronic$total)
+data.table(period=1/medtronic_p$freq,
+           spec=medtronic_p$spec)[order(-spec)][1:10]
+```
+
+### 4. Model building
+We want to evaluate model quality by comparing forecast accuracy. It may be unstable to split the time series into train set and test set just for once. A more sophisticated version of training/test sets is time series cross-validation. So we use cross-validation to get a more accurate result.
+
+Our final goal is to forecast 1 day in the future so we compare the forecast accuracy of each model to forecast one day and select the best one.
+
+#### 4.1 Creating train set from cross-validation
+
+```{r}
+medtronic_tr <- medtronic %>% 
+  stretch_tsibble(.init = 144*7*7, .step=234) %>% 
+  relocate(date, total, .id) 
+```
+
+#### 4.2 Model selection
+We use mean model and SNAIVE model as benchmarks. 
+
+The decomposition can also be used in forecasting, with each of the seasonal components forecast using a seasonal naïve method, and the seasonally adjusted data forecast using ETS.
+
+Finally, we consider ARIMA models. Firstly, an automatic ARIMA model, the parameters are decided by ARIMA function in fable package. Secondly, ARIMA model by setting 1 for the number of lag observations in the model; also known as the lag order, for the number of times that the raw observations are differenced; also known as the degree of differencing, for the size of the moving average window; also known as the order of the moving average in non-seasonal part of the model. Also, we set 1 for the degree of differencing in seasonal part of the model. The last model is ARIMA model with multiple seasonal period. The periods, 144 and 1008, are applied in the calculation.
+
+```{r}
+fitmedtronic <- model(medtronic_tr,
+                autoarima = (ARIMA(total)),
+                arima111010 = (ARIMA(total ~ 0 + pdq(1, 1, 1) + PDQ(0, 1, 0, 
+                                                                  period = "1 
+                                                                  day"))),
+                arimacomp = (ARIMA(total ~ PDQ(0, 0, 0) + pdq(d = 0) +
+                      fourier(period = 144, K = 1) +
+                      fourier(period = 1008, K = 1))),
+                mean = MEAN(total),
+                snaive = SNAIVE(total ~ lag("day")),
+                decomp = decomposition_model(STL(total,robust=TRUE),
+                            ETS(season_adjust~season("A"))))
+
+medfor_all <- fitmedtronic %>% 
+          forecast(h = 234) %>%
+          accuracy(medtronic)
+```
+
+From the result of accuracy, exponential smoothing combining with STL decomposition model is the selected model.
+
+#### 4.3 Selected model with regressors (weather variables)
+
+Usually the weather conditions can influence people's choice of transportation. We also would like to use the weather data to develop a better forecast however, it's difficult for ETS to add regressors. Thus, we set aside this for further study. Reference: https://robjhyndman.com/hyndsight/ets-regressors/
+
+### 5. Checking residuals
+
+There are spikes in ACF plot but they are very small (-0.025-0.05). However, the plot shows only the first 40 lags but the lags in our data set might be longer than that (100++ lags). Thus, we cannot conclude that the residuals have no autocorrelation.  
+From the Ljung test, pvalue is very low so our residual is not independently distributed so we conclude that the residuals have autocorrelations.
+Also, the residuals are not normally distributed (from QQ plot).
+```{r}
+
+fitmedtronic_final <- model(medtronic, 
+                            decomposition_model(STL(total,robust=TRUE),
+                            ETS(season_adjust~season("A"))))
+
+gg_tsresiduals(fitmedtronic_final)
+#acf: although there are spikes but they are very small (0.06)  
+
+resi_medtronicest <- fitmedtronic_final %>% residuals(type = c("innovation"))
+qqPlot(resi_medtronicest$.resid)
+#the residuals are not normally distributed. For further study, we should consider other variables
+
+Box.test(resi_medtronicest$.resid, type = "Ljung")
+#pvalue (3e-06) is very low so our residual is not independently distributed so it's not whitenoise
+```
+
+
+### 6. Forecast
+```{r}
+med_forecast <- fitmedtronic_final %>% forecast(h=234) %>% hilo(level = c(90))
+
+med_forecast <- med_forecast %>% 
+  mutate(UpperBound=med_forecast$`90%`$upper)
+
+#diff_mean_upper <- med_forecast$`90%`$upper - med_forecast$.mean
+#med_forecast$.mean<- pmax(med_forecast$.mean,0)
+#med_forecast$upper <- med_forecast$.mean+diff_mean_upper
+
+fitmedtronic_final %>% forecast(h=234) %>% 
+  autoplot(medtronic, level=0) + 
+  geom_line(aes(y = .fitted, color = "Fitted"), data = 
+              augment(fitmedtronic_final))
+```
+
+## Moulin
+
+### 1. Plot data and see the pattern
+The plot and the kpss test show that the time series is not stationary
+```{r}
+moulin %>% autoplot(total, size=0.7) + 
+  theme(legend.position = 'bottom')
+
+moulin %>% features(total,unitroot_kpss) 
+#pvalue (0.01) is very low so we reject the null hypothesis that the time series is stationary
+```
+
+#### 1.2 Find a proper diferencing for non-stationary
+The unitroot test shows that only one difference is proper to create stationary
+```{r, echo = FALSE, message = FALSE, warning=FALSE}
+moulin %>% features(total,unitroot_ndiffs)
+moulin %>% features(difference(total),unitroot_kpss)
+#pvalue is 0.1 which is large enough to not reject the null hypothesis
+```
+
+#### 1.3 Examine ACF and PACF to determine model
+The chart shows that the data with one differencing is stationary; however, it seems to have seasonality from ACF plot.
+```{r, echo = FALSE, message = FALSE, warning=FALSE}
+gg_tsdisplay(moulin,difference(total), plot_type = "partial", lag_max = 2000)
+```
+
+### 2. STL decompostion plot
+We use the STL decomposition to see whether there is seasonality or trend.
+Components:
+1.trend: 
+Similar to Medtronic, there was no trend before May 7th. After that, there has been a strong downward trend.
+2.seasonality: Strong daily and weekly seasonality.
+3.remainder: the remainder is very large. It means remainder accounts for a large part of variation of data.
+
+```{r}
+moulin.STL <- moulin %>% model(STL(total,robust = TRUE))
+moulin.STL %>% components() %>% autoplot()
+```
+
+### 3. Periodogram
+
+We use the periodogram to check the seasonality of time series by using a below formula to calculate the 2 largest seasonality periods. However, there are strong daily and weekly seasonalities in Medtronic station. Thus, 144(6 * 24) and 1008(144 * 7) will be applied for running period since they refer to 1 day and 1 week respectively.
+```{r}
+moulin_p<-periodogram(moulin$total)
+data.table(period=1/moulin_p$freq,
+           spec=moulin_p$spec)[order(-spec)][1:10]
+```
+
+### 4. Model building
+We want to evaluate model quality by comparing forecast accuracy. It may be unstable to split the time series into train set and test set just for once. A more sophisticated version of training/test sets is time series cross-validation. So we use cross-validation to get a more accurate result.
+
+Our final goal is to forecast 1 day in the future so we compare the forecast accuracy of each model to forecast one day and select the best one.
+
+#### 4.1 Creating train set from cross-validation
+
+```{r}
+moulin_tr <- moulin %>% 
+  stretch_tsibble(.init = 144*7*7, .step=234) %>% 
+  relocate(date, total, .id) 
+```
+
+#### 4.2 Model selection
+We use mean model ans SNAIVE model as bench marks. 
+
+The decomposition can also be used in forecasting, with each of the seasonal components forecast using a seasonal naïve method, and the seasonally adjusted data forecast using ETS.
+
+Finally, we consider ARIMA models. Firstly, an automatic ARIMA model, the parameters are decided by ARIMA function in fable package. Secondly, ARIMA model by setting 1 for the number of lag observations in the model; also known as the lag order, for the number of times that the raw observations are differenced; also known as the degree of differencing, for the size of the moving average window; also known as the order of the moving average in non-seasonal part of the model. Also, we set 1 for the degree of differencing in seasonal part of the model. The last model is ARIMA model with multiple seasonal period. The periods, 144 and 1008, are applied in the calculation.
+
+```{r}
+fitmoulin <- model(moulin_tr,
+                autoarima = (ARIMA(total)),
+                arima111010 = (ARIMA(total ~ 0 + pdq(1, 1, 1) + PDQ(0, 1, 0, 
+                                                                  period = "1 
+                                                                  day"))),
+                arimacomp = (ARIMA(total ~ PDQ(0, 0, 0) + pdq(d = 0) +
+                      fourier(period = 144, K = 1) +
+                      fourier(period = 1008, K = 1))),
+                mean = MEAN(total),
+                snaive = SNAIVE(total ~ lag("day")),
+                decomp = decomposition_model(STL(total,robust=TRUE),
+                            ETS(season_adjust~season("A"))))
+
+moufor_all <- fitmoulin %>% 
+          forecast(h = 234) %>%
+          accuracy(moulin)
+```
+
+From the result of accuracy, exponential smoothing combining with STL decomposition model is the selected model
+
+#### 4.3 Selected model with regressors (weather variables)
+
+Usually the weather conditions can influence people's choice of transportation. We also would like to use the weather data to develop a better forecast however, it's difficult for ETS to add regressors. Thus, we set aside this for further study. Reference: https://robjhyndman.com/hyndsight/ets-regressors/
+
+### 5. Checking residuals
+
+From both the ACF chart and the Ljung-box test, the residuals have serial correlation.
+  
+Also, the residuals are not normally distributed (from QQ plot).
+```{r}
+
+fitmoulin_final <- model(moulin, 
+                            decomposition_model(STL(total,robust=TRUE),
+                            ETS(season_adjust~season("A"))))
+
+gg_tsresiduals(fitmoulin_final)
+#acf: although there are spikes but they are very small (0.06)  
+
+resi_moulinest <- fitmoulin_final %>% residuals(type = c("innovation"))
+qqPlot(resi_moulinest$.resid)
+#the residuals are not normally distributed. For further study, we should consider other variables
+
+Box.test(resi_moulinest$.resid, type = "Ljung")
+#pvalue (1e-11) is very low so our residual is not independently distributed so it's not whitenoise
+```
+
+
+### 6. Forecast
+```{r}
+mou_forecast <- fitmoulin_final %>% forecast(h=234) %>% hilo(level = c(90))
+
+mou_forecast <- mou_forecast %>%
+  mutate(UpperBound=mou_forecast$`90%`$upper)
+
+#diff_mean_upper <- mou_forecast$`90%`$upper - mou_forecast$.mean
+#mou_forecast$.mean<- pmax(mou_forecast$.mean,0)
+#mou_forecast$upper <- mou_forecast$.mean+diff_mean_upper
+
+fitmoulin_final %>% forecast(h=234) %>% 
+  autoplot(moulin, level=0) + 
+  geom_line(aes(y = .fitted, color = "Fitted"), data = 
+              augment(fitmoulin_final))
+
+```
+
+
+
+## preverenges
+
+### 1. Plot data and see the pattern
+
+It is hard to see clear trend and seasonality of preverenges station from the plot.
+```{r}
+preverenges %>% autoplot(total, size=0.7) + 
+  theme(legend.position = 'bottom')
+
+```
+
+### 2.STL decompostion plot
+We use the STL decomposition to see whether there is seasonality or trend.
+Components:
+1.trend: no clear trend.
+2.seasonality: according to the size of the grey bar to the left of each panel, the weekly seasonality is the largest and then is the daily seasonality. The hourly seasonality is the smallest. But all these seasonality is very small.
+3.remainder: We can notice that the remainder is very large. It means remainder accounts for a large part of variation of data.
+
+```{r}
+preverenges.STL <- preverenges %>% model(STL(total,robust = TRUE))
+preverenges.STL %>% components() %>% autoplot()
+```
+
+### 3.periodogram
+
+We try to use the periodogram to check the seasonality of time series. It is hard to see from the plot so we use a formula to calculate the 2 largest seasonality periods.
+```{r}
+preverenges_p<-periodogram(preverenges$total)
+data.table(period=1/preverenges_p$freq,
+           spec=preverenges_p$spec)[order(-spec)][1:2]
+```
+### 4.build model
+
+We want to evaluate model quality by comparing forecast accuracy. It may be unstable to split the time series into train set and test set just for once. A more sophisticated version of training/test sets is time series cross-validation. So we use cross-validation to get a more accurate result.
+
+Our final goal is to forecast 1 day in the future so we compare the forecast accuracy of each model to forecast one day and select the best one.
+
+#### 4.1 create train set for cross-validation
+
+```{r}
+preverenges_tr <- preverenges %>% stretch_tsibble(.init = 144*7*7, 
+                                                  .step=234)%>%
+  relocate(date, total, .id) 
+```
+
+#### 4.2 select best model
+
+We use mean model ans SNAIVE model as bench marks. 
+
+We also use ETS model.
+
+The decomposition can also be used in forecasting, with each of the seasonal components forecast using a seasonal naïve method, and the seasonally adjusted data forecast using ETS.
+
+Finally We consider ARIMA models, one is an automatic ARIMA model which will be decided by fable package ARIMA function and other one is ARIMA model with multiple seasonal period. We use the period calculated according to periodgram.For the k value of fourier, we try to make k=1, k=2 and k=3 to see the difference. We find that k=3 gives the smallest RMSE to the ARIMA with multi-seasonality model.
+
+```{r}
+preverenges_tr %>%
+  model(mean=MEAN(total),
+        snaive = SNAIVE(total ~ lag("day")),
+        ets = ETS(total),
+        stlets=decomposition_model(STL(total,robust=TRUE),
+                            ETS(season_adjust~season("N"))),
+        arimaa=ARIMA(total),
+        arimaf=ARIMA(total ~ PDQ(0, 0, 0) + pdq(d = 0)+
+                       fourier(period=3645,K = 3)+
+                       fourier(period=1215,K = 3))
+        ) %>% forecast(h = 234) %>% accuracy(preverenges)
+```
+
+
+We want the model with the smallest RMSE so we choose the ARIMA model with multiple seasonal period.
+
+#### 4.3 combine with weather variables
+
+Usually the weather conditions can influence people's choice of transportation. We also want to use the weather data to help us make a better forecast so we add regression on ARIMA model with multiple seasonal period.
+
+```{r}
+preverenges_fit <- preverenges %>% 
+  model(arimaf=ARIMA(total ~ PDQ(0, 0, 0) + pdq(d = 0)+
+                       fourier(period=3645,K = 3)+
+                       fourier(period=1215,K = 3)+
+                       tre200s0+rre150z0+fu3010z0))
+report(preverenges_fit)
+```
+
+
+### 5.Residual diagnostics
+According to the ACF plot, the innovation residuals are uncorrelated.It shows there is no information left in the residuals which should be used in computing forecasts.
+The innovation residuals have zero mean which shows the forecasts are unbiased.
+```{r}
+preverenges_fit %>% gg_tsresiduals()
+```
+
+
+### 6.forecast
+
+```{r}
+preverenges_forecast <- preverenges_fit %>%
+  forecast(h=234, new_data=preverenges_weather_forecast ) %>% hilo(level = c(90))
+# we need to put weather forecast into new_data
+
+preverenges_forecast <- preverenges_forecast %>%
+  mutate(preverenges_forecast$`90%`$upper)%>% 
+  dplyr::select(-tre200s0, -rre150z0, -fu3010z0)
+
+
+preverenges %>% autoplot(total)+
+  autolayer(preverenges_forecast,color="red")
+```
+
+
+## sablon
+
+### 1. Plot data and see the pattern
+
+It is hard to see clear trend and seasonality of sablon station from the plot.
+```{r}
+sablon %>% autoplot(total, size=0.7) + 
+  theme(legend.position = 'bottom')
+
+```
+
+### 2.STL decompostion plot
+We use the STL decomposition to see whether there is seasonality or trend.
+Components:
+1.trend: no clear trend.
+2.seasonality: according to the size of the grey bar to the left of each panel, the weekly seasonality is the largest and then is the daily seasonality. The hourly seasonality is the smallest. But all these seasonality is very small.
+3.remainder: We can notice that the remainder is very large. It means remainder accounts for a large part of variation of data.
+
+```{r}
+sablon.STL <- sablon %>% model(STL(total,robust = TRUE))
+sablon.STL %>% components() %>% autoplot()
+```
+
+### 3.periodogram
+
+We try to use the periodogram to check the seasonality of time series. It is hard to see from the plot so we use a formula to calculate the 2 largest seasonality periods.
+```{r}
+sablon_p<-periodogram(sablon$total)
+data.table(period=1/sablon_p$freq,
+           spec=sablon_p$spec)[order(-spec)][1:2]
+```
+
+### 4.build model
+
+We want to evaluate model quality by comparing forecast accuracy. It may be unstable to split the time series into train set and test set just for once. A more sophisticated version of training/test sets is time series cross-validation. So we use cross-validation to get a more accurate result.
+
+Our final goal is to forecast 1 day in the future so we compare the forecast accuracy of each model to forecast one day and select the best one.
+
+#### 4.1 create train set for cross-validation
+
+```{r}
+sablon_tr <- sablon %>% stretch_tsibble(.init = 144*7*7, 
+                                                  .step=234)%>%
+  relocate(date, total, .id) 
+```
+
+#### 4.2 select best model
+
+We use mean model ans SNAIVE model as bench marks. 
+
+We also use ETS model.
+
+The decomposition can also be used in forecasting, with each of the seasonal components forecast using a seasonal naïve method, and the seasonally adjusted data forecast using ETS.
+
+Finally We consider ARIMA models, one is an automatic ARIMA model which will be decided by fable package ARIMA function and other one is ARIMA model with multiple seasonal period. We use the period calculated according to periodgram.
+
+```{r}
+sablon_tr %>%
+  model(mean=MEAN(total),
+        snaive = SNAIVE(total ~ lag("day")),
+        ets = ETS(total),
+        stlets=decomposition_model(STL(total,robust=TRUE),
+                            ETS(season_adjust~season("N"))),
+        arimaa=ARIMA(total),
+        arimaf=ARIMA(total ~ PDQ(0, 0, 0) + pdq(d = 0)+
+                       fourier(period=3645,K = 1)+
+                       fourier(period=1822,K = 1))
+        ) %>% forecast(h = 234) %>% accuracy(sablon)
+```
+
+
+We want the model with the smallest RMSE so we choose simple ARIMA model, ETS model andSTL+ETS model. These three models have similar RMSE value.
+
+
+#### 4.3 combine with weather variables
+ue to the difficulty in ETS and regressors, we set aside it for further study. Reference: https://robjhyndman.com/hyndsight/ets-regressors/
+
+```{r}
+sablon_fit <- sablon %>% 
+  model(arimaa=ARIMA(total~tre200s0+rre150z0+fu3010z0))
+report(sablon_fit)
+```
+
+
+
+### 5.Residual diagnostics
+
+According to the ACF plot, the innovation residuals are correlated.It shows there still has information left in the residuals which should be used in computing forecasts. The model can be improved.
+The innovation residuals have zero mean which shows the forecasts are unbiased.
+```{r}
+sablon_fit_stlets <- sablon %>% 
+  model(stlets=decomposition_model(STL(total,robust=TRUE),
+                            ETS(season_adjust~season("N"))))
+report(sablon_fit_stlets)
+sablon_fit_stlets %>% gg_tsresiduals()
+```
+
+Since the simple ARIMA model and ETS model has similar RMSE value as STL+ETS model, we check the residual of simple ARIMA model with regression and ETS model.
+From the residual plots we see that both simple ARIMA model and ETS model has uncorrelated residuals and the mean of residuals is 0.
+
+```{r}
+sablon_fit %>% gg_tsresiduals()
+```
+
+```{r}
+sablon_fit_ets<- sablon %>% 
+  model(ets = ETS(total))
+report(sablon_fit_ets)
+sablon_fit_ets %>% gg_tsresiduals()
+```
+
+### 6.forecast
+We finally decide to use ARIMA with regression to forecast.
+
+```{r}
+sablon_forecast <- sablon_fit %>%
+  forecast(h=234, new_data=sablon_weather_forecast ) %>% hilo(level = c(90))
+
+sablon_forecast <- sablon_forecast %>%
+  mutate(sablon_forecast$`90%`$upper)%>% 
+  dplyr::select(-tre200s0, -rre150z0, -fu3010z0)
+
+sablon%>% autoplot(total)+
+  autolayer(sablon_forecast,color="red")
+```
+
+## final table
+
+```{r}
+#l=list(as.data.frame(casino_forecast),
+#       as.data.frame(dufour_forecast.auto),
+#       as.data.frame(temple_forecast2),
+#       as.data.frame(med_forecast),
+#       as.data.frame(mou_forecast),
+#       as.data.frame(sablon_forecast),
+#       as.data.frame(preverenges_forecast),
+#       as.data.frame(gracieuse_forecast))
+
+#final_forecast <- rbindlist(l)
+```
+
+```{r}
+# write.csv(x = casino_forecast,file = "casino.csv")
+# write.csv(x = dufour_forecast.auto,file = "dufour.csv")
+# write.csv(x = temple_forecast2,file = "temple.csv")
+# write.csv(x = med_forecast,file = "medtronic.csv")
+# write.csv(x = mou_forecast,file = "moulin.csv")
+# write.csv(x = gracieuse_forecast,file = "gracieuse.csv")
+# write.csv(x = preverenges_forecast,file = "preverenges.csv")
+# write.csv(x = sablon_forecast,file = "sablon.csv")
+```
+

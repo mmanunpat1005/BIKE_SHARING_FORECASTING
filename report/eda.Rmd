@@ -1,0 +1,232 @@
+---
+output: html_document
+
+---
+# Data preparation and Exploratory data analysis
+
+```{r, echo = FALSE, message = FALSE, warning=FALSE}
+source(here::here("scripts/setup.R"))
+```
+
+## Data preparation  
+
+### Table 1: Bike sharing  
+load and prepare data to the tsibble format. There are gaps in time series so we use function 'fill_gap'.
+```{r}
+load(here::here("data/Bikesharing_dataset.Rdata")) 
+```
+
+```{r}
+# clean original data
+morges <- rbind(series$Medtronic, series$Dufour, series$Casino, series$Temple, series$Sablon, series$Moulin, series$Gracieuse, series$Préverenges) %>%
+  dplyr::filter(date >= as_datetime("2022-03-10 00:00:00"))
+
+# change to tsibble
+morges_tsibble <- morges %>% 
+          as_tsibble(index = date, key = c(name))%>%
+          rename("E_Bike" = "E-Bike") %>%
+          mutate(total = Bike + E_Bike)
+
+# missing data
+scan_gaps(morges_tsibble)
+morges_tsibble <- morges_tsibble %>% fill_gaps()
+count_gaps(morges_tsibble) #0 gap
+morges_tsibble<- morges_tsibble %>% na.locf() #replace the NA by its lasted value before
+sum(is.na(morges_tsibble))
+```
+
+
+### Table 2.1: weather real data
+*Data Description*
+\* `stn`: Station abbreviation:NABLAU(in Lausanne)\
+\* `date`: measurement time\
+\* `tre200s0(unit:°C)`: air temperature at 2 m from the ground; instantaneous value.\
+\* `tvi200s0(unit:°C)`: virtual temperature at 2 m from the ground; instantaneous value\
+\* `rre150g0(unit:mm)`: precipitation; cumulative hourly sum (over 6 intervals of 10 min.)\
+\* `rre150z0(unit:mm)`: precipitation: summation over 10 minutes\
+\* `fkl010z0(m/s)`: scalar wind speed; average over 10 minutes\
+\* `fu3010z0(km/h)`: wind speed; average over 10 minutes\
+
+```{r}
+#setup table for weather
+weather_raw <- read.delim(here::here('data/weather history.txt'), header = F, sep = ";")
+colnames(weather_raw) <- weather_raw[2,]
+weather_raw <- weather_raw[-c(1:2),]
+weather_raw <- weather_raw %>%
+  dplyr::filter(stn == "NABLAU")
+
+weather_raw <- weather_raw %>%
+  mutate(date=ymd_hm(as.character(weather_raw$time))) %>%
+  dplyr::select(-time) %>%
+  dplyr::select(stn, date, everything())
+weather_raw[,3:8]<-lapply(weather_raw[,3:8],as.numeric)
+
+# change to tsibble
+weather_tsible <- weather_raw %>% 
+          as_tsibble(index = date, key = c(stn))
+
+#missing data
+scan_gaps(weather_tsible) #0 gap
+weather_tsible<- weather_tsible %>% na.locf() 
+sum(is.na(weather_tsible))
+
+```
+
+### Table 2.2: Weather forecast data
+We download the weather forecast from this website:
+https://www.visualcrossing.com/weather/weather-data-services/lausanne/metric
+
+We only need the information of temperature, precipitation and weed speed. What's more, the weather forecast data is hourly data, we need to change it into every 10 minutes to make it is consistent with the time series of our bike-sharing data.
+
+```{r}
+weather_forcast <- read_csv(here::here('data/morges.csv')) 
+weather_forcast <- weather_forcast %>% dplyr::select(name, date, temp, precip, windspeed) 
+
+weather_forcast <- weather_forcast %>%
+  mutate(date=ymd_hms(weather_forcast$date))
+
+weather_forcast_tsibble <- weather_forcast %>% 
+          as_tsibble(index = date) %>%
+  dplyr::select(-name)
+
+weather_forcast_tsibble <- weather_forcast_tsibble %>% rename(tre200s0=temp,rre150z0=precip,fu3010z0=windspeed)
+
+morges_forecast <- new_data(morges_tsibble,234)
+
+morges_weather_forecast <- left_join(morges_forecast, weather_forcast_tsibble, by = "date")
+head(morges_weather_forecast)
+
+
+morges_weather_forecast<- morges_weather_forecast %>% na.locf(fromLast=TRUE) # change the NA
+head(morges_weather_forecast)
+```
+
+#### weather forecast for each station
+```{r}
+#here is the new_data we will use to forecast
+casino_weather_forecast <- morges_weather_forecast %>% dplyr::filter(name == "Casino")
+medtronic_weather_forecast <- morges_weather_forecast %>% dplyr::filter(name == "Medtronic")
+dufour_weather_forecast <- morges_weather_forecast %>% dplyr::filter(name == "Dufour")
+temple_weather_forecast <- morges_weather_forecast %>% dplyr::filter(name == "Temple")
+sablon_weather_forecast <- morges_weather_forecast %>% dplyr::filter(name == "Sablon")
+moulin_weather_forecast <- morges_weather_forecast %>% dplyr::filter(name == "Moulin")
+gracieuse_weather_forecast <- morges_weather_forecast %>% dplyr::filter(name == "Gracieuse")
+preverenges_weather_forecast <- morges_weather_forecast %>% dplyr::filter(name == "Préverenges")
+```
+
+
+### Table 3.1: real Weather+Bikesharing 
+
+```{r}
+# combine bikesharing data and weather real data
+morges.weather <- left_join(morges_tsibble, weather_tsible, by = "date")
+head(morges.weather)
+
+# weekend-weekday
+#morges.weather <- morges.weather %>% 
+#  mutate(day_of_week = weekdays(morges.weather$date))
+
+#morges.weather$day_of_week <- ifelse(morges.weather$day_of_week == "Sunday", 1, ifelse(morges.weather$day_of_week == "Saturday", 1, 0))
+```
+
+
+#### real Weather+Bikesharing per station
+
+```{r}
+#Setup the tables for each station
+casino <- morges.weather %>% dplyr::filter(name == "Casino")
+medtronic <- morges.weather %>% dplyr::filter(name == "Medtronic")
+dufour <- morges.weather %>% dplyr::filter(name == "Dufour")
+temple <- morges.weather %>% dplyr::filter(name == "Temple")
+sablon <- morges.weather %>% dplyr::filter(name == "Sablon")
+moulin <- morges.weather %>% dplyr::filter(name == "Moulin")
+gracieuse <- morges.weather %>% dplyr::filter(name == "Gracieuse")
+preverenges <- morges.weather %>% dplyr::filter(name == "Préverenges")
+```
+
+## Exploratory data analysis   
+
+### Bike-sharing Time series  
+<br>
+There are no significant trend in the time series of each station. But it seems there are a daily and weekly seasonality at Metronic and Moulin station which will be investigated further. Later We will use gg_season() to draw season plots to further check the seasonality of each station.
+<br>
+```{r}
+morges_tsibble %>% autoplot(total, size=0.7) + 
+  facet_grid(vars(name),scales = "free_y")+
+  theme(legend.position = 'bottom')
+```
+
+### Weather Time series 
+From the correlation plot, tre200s0 (air temperature) and tvi200s0 (virtual temperature) are positively highly correlated (correlation = 1). rre150g0 and rre150z0, measure precipitation, are also positively highly correlated (0.708). Moreover, fkl010z0(m/s), scalar wind speed and fu3010z0(km/h), wind speed, are perfectly highly correlated (1).
+```{r }
+#correlation among 6 variables
+weather_temp <- weather_tsible[3:8]
+ggpairs(weather_temp)
+```
+
+According to the correlation analysis, tre200s0 is similar to tvi200s0, rre150g0 is similar to rre150z0 and fkl010z0 is similar to fu3010z0, we decide to choose one of each pair to avoid duplicate information. We choose tre200s0, rre150z0 and fu3010z0.
+
+We spotted daily seasonality in temperature time series. For precipitation and wind speed time series, the spikes from both time series have similar pattern. For example, there are some spikes on both time series on March 15. Thus, the two variables are correlated. 
+```{r }
+# air temperature time series plot
+p1 <- weather_tsible %>% autoplot(tre200s0, size=0.6)+ylab("air temperature(unit:°C)")
+
+# precipitation time series plot
+p2 <- weather_tsible %>% autoplot(rre150z0, size=0.6)+ylab("precipitation(unit:mm)")
+
+# wind speed time series plot
+p3 <- weather_tsible %>% autoplot(fu3010z0, size=0.6)+ylab("wind speed(unit:km/h)")
+
+p1/p2/p3
+```
+
+### Box plot  
+<br>
+
+```{r }
+morges_tsibble %>%
+  mutate(name = fct_reorder(name, total, .fun='median')) %>%
+  ggplot(aes(x=reorder(name, total), y=total, fill=name)) + 
+    geom_boxplot() +
+    xlab("name") +
+    theme(legend.position="none") +
+    xlab("")
+```
+
+### Seasonality plot   
+Moulin: there is a seasonality (opposite to the Medtronic): people are using bikes during the day. High bike availability is approximately before 7 am and after 7 pm. Day of the week is an important variable because of the pattern of it 
+
+Medtronic: there is a seasonality: people are using bikes to commute to work. High demand after work because significant decline in bike availability. Also, people might return bikes in this station before working hours. Day of the week is a variable because of the pattern of it
+
+Dufour: small station and no pattern
+
+Temple: small station and quite difficult to see seasonality. Probably, people are using bikes between 10.00 to 15.00.
+
+Sablon: big station and the pattern may be similar to Moulin
+
+casino, gracieuse and preverenges: no clear pattern   
+
+We will use STL decomposition plot to further check the seasonality of each station.
+
+**Weekly Seasonality**  
+
+```{r, fig.height= 6}
+morges_tsibble %>% 
+  gg_season(total,
+            period = "week") +
+  facet_wrap(vars(name))+
+  theme(axis.text.x = element_text(angle=90))+
+  labs(x = "day")+
+  theme(legend.position = 'bottom')
+```
+**Daily Seasonality**  
+   
+```{r, fig.height= 6}
+morges_tsibble %>% gg_season(total,period = "day") +
+  facet_wrap(vars(name)) +
+  labs(x = "hour")+
+  theme(legend.position = 'bottom')
+```
+
+
+
